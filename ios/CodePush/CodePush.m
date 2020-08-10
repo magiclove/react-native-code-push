@@ -31,6 +31,10 @@
     long long _latestExpectedContentLength;
     long long _latestReceivedConentLength;
     BOOL _didUpdateProgress;
+    
+    BOOL _allowed;
+    BOOL _restartInProgress;
+    NSMutableArray *_restartQueue;
 }
 
 RCT_EXPORT_MODULE()
@@ -369,8 +373,11 @@ static NSString *const LatestRollbackCountKey = @"count";
 
 - (instancetype)init
 {
+    _allowed = YES;
+    _restartInProgress = NO;
+    _restartQueue = [NSMutableArray arrayWithCapacity:1];
+    
     self = [super init];
-
     if (self) {
         [self initializeUpdateAfterRestart];
     }
@@ -642,10 +649,6 @@ static NSString *const LatestRollbackCountKey = @"count";
 // a resume-based update still pending installation.
 - (void)applicationWillEnterForeground
 {
-    if (_appSuspendTimer) {
-        [_appSuspendTimer invalidate];
-        _appSuspendTimer = nil;
-    }
     // Determine how long the app was in the background and ensure
     // that it meets the minimum duration amount of time.
     int durationInBackground = 0;
@@ -653,8 +656,18 @@ static NSString *const LatestRollbackCountKey = @"count";
         durationInBackground = [[NSDate date] timeIntervalSinceDate:_lastResignedDate];
     }
 
-    if (durationInBackground >= _minimumBackgroundDuration) {
-        [self loadBundle];
+    if (_installMode == CodePushInstallModeOnNextSuspend) {
+        // We shouldn't use loadBundle in this case, because _appSuspendTimer will call loadBundleOnTick.
+        // We should cancel timer for _appSuspendTimer because otherwise, we would call loadBundle two times.
+        if (durationInBackground < _minimumBackgroundDuration) {
+            [_appSuspendTimer invalidate];
+            _appSuspendTimer = nil;
+        }
+    } else {
+        // For resume install mode.
+        if (durationInBackground >= _minimumBackgroundDuration) {
+            [self restartAppInternal:NO];
+        }
     }
 }
 
@@ -674,7 +687,7 @@ static NSString *const LatestRollbackCountKey = @"count";
 }
 
 -(void)loadBundleOnTick:(NSTimer *)timer {
-    [self loadBundle];
+    [self restartAppInternal:NO];
 }
 
 #pragma mark - JavaScript-exported module methods (Public)
@@ -744,6 +757,33 @@ RCT_EXPORT_METHOD(downloadUpdate:(NSDictionary*)updatePackage
             self.paused = YES;
             reject([NSString stringWithFormat: @"%lu", (long)err.code], err.localizedDescription, err);
         }];
+}
+
+- (void)restartAppInternal:(BOOL)onlyIfUpdateIsPending
+{
+    if (_restartInProgress) {
+        CPLog(@"Restart request queued until the current restart is completed.");
+        [_restartQueue addObject:@(onlyIfUpdateIsPending)];
+        return;
+    } else if (!_allowed) {
+        CPLog(@"Restart request queued until restarts are re-allowed.");
+        [_restartQueue addObject:@(onlyIfUpdateIsPending)];
+        return;
+    }
+
+    _restartInProgress = YES;
+    if (!onlyIfUpdateIsPending || [[self class] isPendingUpdate:nil]) {
+        [self loadBundle];
+        CPLog(@"Restarting app.");
+        return;
+    }
+
+    _restartInProgress = NO;
+    if ([_restartQueue count] > 0) {
+        BOOL buf = [_restartQueue valueForKey: @"@firstObject"];
+        [_restartQueue removeObjectAtIndex:0];
+        [self restartAppInternal:buf];
+    }
 }
 
 /*
@@ -895,6 +935,7 @@ RCT_EXPORT_METHOD(setLatestRollbackInfo:(NSString *)packageHash
                   reject:(RCTPromiseRejectBlock)reject)
 {
     [[self class] setLatestRollbackInfo:packageHash];
+    resolve(nil);
 }
 
 
@@ -932,6 +973,37 @@ RCT_EXPORT_METHOD(notifyApplicationReady:(RCTPromiseResolveBlock)resolve
     resolve(nil);
 }
 
+RCT_EXPORT_METHOD(allow:(RCTPromiseResolveBlock)resolve
+                    rejecter:(RCTPromiseRejectBlock)reject)
+{
+    CPLog(@"Re-allowing restarts.");
+    _allowed = YES;
+
+    if ([_restartQueue count] > 0) {
+        CPLog(@"Executing pending restart.");
+        BOOL buf = [_restartQueue valueForKey: @"@firstObject"];
+        [_restartQueue removeObjectAtIndex:0];
+        [self restartAppInternal:buf];
+    }
+
+    resolve(nil);
+}
+
+RCT_EXPORT_METHOD(clearPendingRestart:(RCTPromiseResolveBlock)resolve
+                    rejecter:(RCTPromiseRejectBlock)reject)
+{
+    [_restartQueue removeAllObjects];
+    resolve(nil);
+}
+
+RCT_EXPORT_METHOD(disallow:(RCTPromiseResolveBlock)resolve
+                    rejecter:(RCTPromiseRejectBlock)reject)
+{
+    CPLog(@"Disallowing restarts.");
+    _allowed = NO;
+    resolve(nil);
+}
+
 /*
  * This method is the native side of the CodePush.restartApp() method.
  */
@@ -939,15 +1011,8 @@ RCT_EXPORT_METHOD(restartApp:(BOOL)onlyIfUpdateIsPending
                      resolve:(RCTPromiseResolveBlock)resolve
                     rejecter:(RCTPromiseRejectBlock)reject)
 {
-    // If this is an unconditional restart request, or there
-    // is current pending update, then reload the app.
-    if (!onlyIfUpdateIsPending || [[self class] isPendingUpdate:nil]) {
-        [self loadBundle];
-        resolve(@(YES));
-        return;
-    }
-
-    resolve(@(NO));
+    [self restartAppInternal:onlyIfUpdateIsPending];
+    resolve(nil);
 }
 
 /*
